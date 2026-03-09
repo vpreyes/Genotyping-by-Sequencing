@@ -1,0 +1,38 @@
+# Paired-end RabbitQC + FastQC on RAW reads (*.fq.gz named *_1.fq.gz / *_2.fq.gz)
+
+INDIR="/WDRED14T/2602_JJRI_Kinkoshi_GBS_downloads/F26A420000074_RICvywqR/Kasahara_F3-1-A"
+OUTBASE="/ReyesHD/GBS022026"
+RABBIT_OUT="${OUTBASE}/RabbitQC"
+FASTQC_OUT="${OUTBASE}/FastQC_raw"
+LOGS="${OUTBASE}/logs"
+
+mkdir -p "${RABBIT_OUT}" "${FASTQC_OUT}" "${LOGS}"
+
+# 1) FastQC on raw reads (runs once per file)
+fastqc -t 16 -o "${FASTQC_OUT}" "${INDIR}"/*.fq.gz \
+  > "${LOGS}/fastqc_raw.log" 2>&1
+
+# 2) RabbitQC on paired-end reads (RabbitQC uses -i/-I and -o/-O, not -1/-2)
+for R1 in "${INDIR}"/*_1*.fq.gz; do
+  [ -e "$R1" ] || continue
+
+  R2="${R1/_1.fq.gz/_2.fq.gz}"
+  [ -e "$R2" ] || { echo "Missing pair for $R1 -> expected $R2"; continue; }
+
+  SAMPLE="$(basename "$R1")"
+  SAMPLE="${SAMPLE%_1.fq.gz}"
+
+  OUT1="${RABBIT_OUT}/${SAMPLE}_1.trim.fq.gz"
+  OUT2="${RABBIT_OUT}/${SAMPLE}_2.trim.fq.gz"
+  JSON="${RABBIT_OUT}/${SAMPLE}.RabbitQC.json"
+  HTML="${RABBIT_OUT}/${SAMPLE}.RabbitQC.html"
+
+  rabbit_qc -w 16 -a AGATCGGAAGAG --detect_adapter_for_pe \
+    -i "$R1" -I "$R2" \
+    -o "$OUT1" -O "$OUT2" \
+    -j "$JSON" -h "$HTML" \
+    > "${LOGS}/${SAMPLE}.rabbitqc.log" 2>&1
+done
+
+# (Optional) Summarize FastQC + RabbitQC reports
+# multiqc -o "${OUTBASE}/multiqc" "${FASTQC_OUT}" "${RABBIT_OUT}" > "${LOGS}/multiqc.log" 2>&1
