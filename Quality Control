@@ -1,23 +1,25 @@
-# Paired-end RabbitQC + FastQC on RAW reads (*.fq.gz named *_1.fq.gz / *_2.fq.gz)
+# Paired-end RabbitQC + FastQC (RAW) with per-run subfolder
 
-INDIR="/WDRED14T/2602_JJRI_Kinkoshi_GBS_downloads/F26A420000074_RICvywqR/Kasahara_F3-1-A"
-OUTBASE="/ReyesHD/GBS022026"
+INDIR="/WDRED14T/2602_JJRI_Kinkoshi_GBS_downloads/F26A420000074_RICvywqR/Kasahara_F3-1-B"
+RUNLABEL="$(basename "$INDIR")"   # -> Kasahara_F3-1-B
+
+OUTBASE="/ReyesHD/GBS022026/${RUNLABEL}"
 RABBIT_OUT="${OUTBASE}/RabbitQC"
 FASTQC_OUT="${OUTBASE}/FastQC_raw"
 LOGS="${OUTBASE}/logs"
 
 mkdir -p "${RABBIT_OUT}" "${FASTQC_OUT}" "${LOGS}"
 
-# 1) FastQC on raw reads (runs once per file)
+# 1) FastQC on raw reads
 fastqc -t 16 -o "${FASTQC_OUT}" "${INDIR}"/*.fq.gz \
   > "${LOGS}/fastqc_raw.log" 2>&1
 
-# 2) RabbitQC on paired-end reads (RabbitQC uses -i/-I and -o/-O, not -1/-2)
+# 2) RabbitQC on paired-end reads
 for R1 in "${INDIR}"/*_1*.fq.gz; do
   [ -e "$R1" ] || continue
 
   R2="${R1/_1.fq.gz/_2.fq.gz}"
-  [ -e "$R2" ] || { echo "Missing pair for $R1 -> expected $R2"; continue; }
+  [ -e "$R2" ] || { echo "Missing pair for $R1 -> expected $R2" | tee -a "${LOGS}/pairs_missing.log"; continue; }
 
   SAMPLE="$(basename "$R1")"
   SAMPLE="${SAMPLE%_1.fq.gz}"
@@ -34,5 +36,5 @@ for R1 in "${INDIR}"/*_1*.fq.gz; do
     > "${LOGS}/${SAMPLE}.rabbitqc.log" 2>&1
 done
 
-# (Optional) Summarize FastQC + RabbitQC reports
+# (Optional) MultiQC summary per run
 # multiqc -o "${OUTBASE}/multiqc" "${FASTQC_OUT}" "${RABBIT_OUT}" > "${LOGS}/multiqc.log" 2>&1
