@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+###########################################
+# GBS TASSEL5 + VCFTools Filtering (with logs + end summary)
+# KDoi / VPReyes
+# Modified: March 09, 2026
+###########################################
+
+set -euo pipefail
+
+############################
+# User-editable parameters #
+############################
+export POPULATION="Kasahara1"
+export KEYFILE="Kasahara-1_Keyfile.txt"
+export ENZYME="PstI-MspI"
+
+# TASSEL5
+export GBSPIPELINE="/linuxhome/reyes/tassel-5-standalone/run_pipeline.pl"
+
+# Tools (auto-detect)
+export BWA="$(command -v bwa)"
+export VCFTOOLS_BIN="$(command -v vcftools)"
+
+# Discovery thresholds (F3 suggestion)
+MINLOCUSCOV=0.6
+MINALLELEFREQ=0.02
+
+# Reference
+REF="/local_data/GBS/rice.fa"
+
+# Threads / memory
+THREADS=16
+JAVA_MEM_20G="-Xmx20g"
+JAVA_MEM_10G="-Xmx10g"
+
+# Logging
+RUNSTAMP="$(date +%Y%m%d_%H%M%S)"
+LOGDIR="./logs_${POPULATION}_${RUNSTAMP}"
+mkdir -p "${LOGDIR}"
+
+log(){ echo "[$(date '+%F %T')] $*" | tee -a "${LOGDIR}/pipeline.log" ; }
+
+###############################################################
+# Helper: end-of-run summary
+###############################################################
+summary(){
+  log "================ END-OF-RUN SUMMARY ================"
+
+  # 1) Tag count (from TagExportToFastqPlugin log if present; else count records)
+  TAGLOG="${LOGDIR}/02_TagExportToFastqPlugin.out"
+  if [[ -s "${TAGLOG}" ]] && grep -q "Total number of tags written" "${TAGLOG}"; then
+    TAGS_WRITTEN="$(grep -Eo 'Total number of tags written: [0-9]+' "${TAGLOG}" | awk '{print $6}' | tail -n 1)"
+    log "Tags written (from TASSEL log): ${TAGS_WRITTEN}"
+  else
+    # Count sequences in exported tag file (FASTA-style: headers start with '>' or FASTQ '@')
+    if [[ -f "${POPULATION}.db.fa.gz" ]]; then
+      FIRSTCHAR="$(zcat "${POPULATION}.db.fa.gz" 2>/dev/null | head -n 1 | cut -c1 || true)"
+      if [[ "${FIRSTCHAR}" == ">" ]]; then
+        TAGS_WRITTEN="$(zcat "${POPULATION}.db.fa.gz" | grep -c '^>' || true)"
+        log "Tags written (counted from FASTA headers): ${TAGS_WRITTEN}"
+      elif [[ "${FIRSTCHAR}" == "@" ]]; then
+        # FASTQ: each record is 4 lines; count headers
+        TAGS_WRITTEN="$(zcat "${POPULATION}.db.fa.gz" | grep -c '^@' || true)"
+        log "Tags written (counted from FASTQ headers): ${TAGS_WRITTEN}"
+      else
+        log "Tags written: could not determine format of ${POPULATION}.db.fa.gz"
+      fi
+    else
+      log "Tags written: ${POPULATION}.db.fa.gz not found"
+    fi
+  fi
+
+  # 2) SNP count from VCF
+  if [[ -s "${POPULATION}.vcf" ]]; then
+    SNP_TOTAL="$(grep -vc '^#' "${POPULATION}.vcf" || true)"
+    log "Total SNPs/variants in VCF: ${SNP_TOTAL}"
+  else
+    log "Total SNPs/variants in VCF: VCF not found or empty (${POPULATION}.vcf)"
+  fi
+
+  # 3) Missingness summary (VCFtools)
+  # NOTE: vcftools accepts .vcf or .vcf.gz; we compute per-individual missingness and summarize.
+  if [[ -s "${POPULATION}.vcf" ]]; then
+    log "Computing missingness with vcftools --missing-indv"
+    "${VCFTOOLS_BIN}" --vcf "${POPULATION}.vcf" --missing-indv --out "${LOGDIR}/${POPULATION}" \
+      > "${LOGDIR}/summary_vcftools_missing_indv.out" 2> "${LOGDIR}/summary_vcftools_missing_indv.err" || true
+
+    IMISS="${LOGDIR}/${POPULATION}.imiss"
+    if [[ -s "${IMISS}" ]]; then
+      # IMISS columns: INDV N_DATA N_GENOTYPES_FILTERED N_MISS F_MISS
+      # Compute mean and max F_MISS (skip header)
+      MEAN_MISS="$(awk 'NR>1{sum+=$5;n+=1} END{if(n>0) printf("%.4f", sum/n); else print "NA"}' "${IMISS}")"
+      MAX_MISS="$(awk 'NR>1{if($5>m)m=$5} END{if(NR>1) printf("%.4f", m); else print "NA"}' "${IMISS}")"
+      WORST_SAMPLE="$(awk 'NR>1{if($5>m){m=$5;id=$1}} END{print id}' "${IMISS}")"
+      log "Per-sample missingness (F_MISS): mean=${MEAN_MISS}  max=${MAX_MISS} (worst=${WORST_SAMPLE})"
+    else
+      log "Missingness summary: ${IMISS} not generated"
+    fi
+  fi
+
+  log "Logs folder: ${LOGDIR}"
+  log "====================================================="
+}
+
+# Always print summary even if a later step fails
+trap 'summary' EXIT
+
+log "Starting pipeline for POPULATION=${POPULATION}"
+log "BWA=${BWA}"
+log "VCFTOOLS=${VCFTOOLS_BIN}"
+log "TASSEL5=${GBSPIPELINE}"
+log "REF=${REF}"
+log "MINLOCUSCOV=${MINLOCUSCOV}  MINALLELEFREQ=${MINALLELEFREQ}"
+
+###############################################################
+# 1) Process FASTQ -> TagDB
+###############################################################
+log "Step 1: GBSSeqToTagDBPlugin"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} -fork1 \
+  -GBSSeqToTagDBPlugin -db "${POPULATION}.db" -i ./ -k "${KEYFILE}" \
+  -kmerLength 64 -e "${ENZYME}" -minKmerL 20 -mnQS 20 -mxKmerNum 100000000 -c 1 \
+  -endPlugin -runfork1 \
+  > "${LOGDIR}/01_GBSSeqToTagDBPlugin.out" 2> "${LOGDIR}/01_GBSSeqToTagDBPlugin.err"
+
+log "Step 2: TagExportToFastqPlugin"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} -fork1 \
+  -TagExportToFastqPlugin -db "${POPULATION}.db" -o "${POPULATION}.db.fa.gz" -c 1 \
+  -endPlugin -runfork1 \
+  > "${LOGDIR}/02_TagExportToFastqPlugin.out" 2> "${LOGDIR}/02_TagExportToFastqPlugin.err"
+
+###############################################################
+# 2) Align tags with BWA
+###############################################################
+if [[ ! -f "${REF}.bwt" ]]; then
+  log "Step 3: bwa index (first run only)"
+  "${BWA}" index "${REF}" > "${LOGDIR}/03_bwa_index.out" 2> "${LOGDIR}/03_bwa_index.err"
+else
+  log "Step 3: bwa index skipped (index exists)"
+fi
+
+log "Step 4: bwa aln"
+"${BWA}" aln -t "${THREADS}" "${REF}" "${POPULATION}.db.fa.gz" \
+  > "${POPULATION}.sai" 2> "${LOGDIR}/04_bwa_aln.err"
+
+log "Step 5: bwa samse"
+"${BWA}" samse "${REF}" "${POPULATION}.sai" "${POPULATION}.db.fa.gz" \
+  > "${POPULATION}.sam" 2> "${LOGDIR}/05_bwa_samse.err"
+
+###############################################################
+# 3) Load alignments to GBS DB and discover SNPs
+###############################################################
+log "Step 6: SAMToGBSdbPlugin"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} -fork1 \
+  -SAMToGBSdbPlugin -i "${POPULATION}.sam" -db "${POPULATION}.db" -aProp 0.0 -aLen 0 \
+  -endPlugin -runfork1 \
+  > "${LOGDIR}/06_SAMToGBSdbPlugin.out" 2> "${LOGDIR}/06_SAMToGBSdbPlugin.err"
+
+log "Step 7: DiscoverySNPCallerPluginV2"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} -fork1 \
+  -DiscoverySNPCallerPluginV2 -db "${POPULATION}.db" -mnLCov "${MINLOCUSCOV}" -mnMAF "${MINALLELEFREQ}" \
+  -endPlugin -runfork1 \
+  > "${LOGDIR}/07_DiscoverySNPCallerPluginV2.out" 2> "${LOGDIR}/07_DiscoverySNPCallerPluginV2.err"
+
+###############################################################
+# 4) Production SNP calling (VCF + H5 + Hapmap export)
+###############################################################
+log "Step 8: ProductionSNPCallerPluginV2 -> VCF"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} -fork1 \
+  -ProductionSNPCallerPluginV2 -db "${POPULATION}.db" -e "${ENZYME}" -i ./ -k "${KEYFILE}" \
+  -kmerLength 64 -mnQS 20 -o "${POPULATION}.vcf" \
+  -endPlugin -runfork1 \
+  > "${LOGDIR}/08_ProductionSNPCaller_VCF.out" 2> "${LOGDIR}/08_ProductionSNPCaller_VCF.err"
+
+log "Step 9: ProductionSNPCallerPluginV2 -> H5"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} -fork1 \
+  -ProductionSNPCallerPluginV2 -db "${POPULATION}.db" -e "${ENZYME}" -i ./ -k "${KEYFILE}" \
+  -kmerLength 64 -mnQS 20 -o "${POPULATION}.h5" \
+  -endPlugin -runfork1 \
+  > "${LOGDIR}/09_ProductionSNPCaller_H5.out" 2> "${LOGDIR}/09_ProductionSNPCaller_H5.err"
+
+log "Step 10: Export Hapmap from H5"
+perl "${GBSPIPELINE}" ${JAVA_MEM_20G} \
+  -h5 "${POPULATION}.h5" -export "${POPULATION}.hmp.txt" -exportType Hapmap \
+  > "${LOGDIR}/10_export_hapmap.out" 2> "${LOGDIR}/10_export_hapmap.err"
+
+log "Pipeline main steps complete (parent filtering steps not included in this excerpt)."
