@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ###########################################
-# GBS TASSEL5 + VCFTools Filtering (with logs + end summary)
+# GBS TASSEL5 + VCFTools Filtering (with logs + end summary + parental filtering)
 # KDoi / VPReyes
 # Modified: March 09, 2026
 ###########################################
@@ -14,8 +14,17 @@ export POPULATION="Kasahara1"
 export KEYFILE="Kasahara-1_Keyfile.txt"
 export ENZYME="PstI-MspI"
 
-# TASSEL5
+# Parents (for parent filtering)
+export PARENT1="T65"
+export PARENT2="DV85"
+export PARENTSAMPLE1="T65"
+export PARENTSAMPLE2="DV85"
+
+# TASSEL5 (GBS discovery/calling)
 export GBSPIPELINE="/linuxhome/reyes/tassel-5-standalone/run_pipeline.pl"
+
+# TASSEL4 (parent filtering utilities)
+export GBSPIPELINE4="/home/reyes/tassel4-standalone/run_pipeline.pl"
 
 # Tools (auto-detect)
 export BWA="$(command -v bwa)"
@@ -46,22 +55,20 @@ log(){ echo "[$(date '+%F %T')] $*" | tee -a "${LOGDIR}/pipeline.log" ; }
 summary(){
   log "================ END-OF-RUN SUMMARY ================"
 
-  # 1) Tag count (from TagExportToFastqPlugin log if present; else count records)
+  # 1) Tag count
   TAGLOG="${LOGDIR}/02_TagExportToFastqPlugin.out"
   if [[ -s "${TAGLOG}" ]] && grep -q "Total number of tags written" "${TAGLOG}"; then
     TAGS_WRITTEN="$(grep -Eo 'Total number of tags written: [0-9]+' "${TAGLOG}" | awk '{print $6}' | tail -n 1)"
     log "Tags written (from TASSEL log): ${TAGS_WRITTEN}"
   else
-    # Count sequences in exported tag file (FASTA-style: headers start with '>' or FASTQ '@')
     if [[ -f "${POPULATION}.db.fa.gz" ]]; then
       FIRSTCHAR="$(zcat "${POPULATION}.db.fa.gz" 2>/dev/null | head -n 1 | cut -c1 || true)"
       if [[ "${FIRSTCHAR}" == ">" ]]; then
         TAGS_WRITTEN="$(zcat "${POPULATION}.db.fa.gz" | grep -c '^>' || true)"
-        log "Tags written (counted from FASTA headers): ${TAGS_WRITTEN}"
+        log "Tags written (counted FASTA headers): ${TAGS_WRITTEN}"
       elif [[ "${FIRSTCHAR}" == "@" ]]; then
-        # FASTQ: each record is 4 lines; count headers
         TAGS_WRITTEN="$(zcat "${POPULATION}.db.fa.gz" | grep -c '^@' || true)"
-        log "Tags written (counted from FASTQ headers): ${TAGS_WRITTEN}"
+        log "Tags written (counted FASTQ headers): ${TAGS_WRITTEN}"
       else
         log "Tags written: could not determine format of ${POPULATION}.db.fa.gz"
       fi
@@ -70,7 +77,7 @@ summary(){
     fi
   fi
 
-  # 2) SNP count from VCF
+  # 2) Variant count in VCF
   if [[ -s "${POPULATION}.vcf" ]]; then
     SNP_TOTAL="$(grep -vc '^#' "${POPULATION}.vcf" || true)"
     log "Total SNPs/variants in VCF: ${SNP_TOTAL}"
@@ -79,7 +86,6 @@ summary(){
   fi
 
   # 3) Missingness summary (VCFtools)
-  # NOTE: vcftools accepts .vcf or .vcf.gz; we compute per-individual missingness and summarize.
   if [[ -s "${POPULATION}.vcf" ]]; then
     log "Computing missingness with vcftools --missing-indv"
     "${VCFTOOLS_BIN}" --vcf "${POPULATION}.vcf" --missing-indv --out "${LOGDIR}/${POPULATION}" \
@@ -87,15 +93,44 @@ summary(){
 
     IMISS="${LOGDIR}/${POPULATION}.imiss"
     if [[ -s "${IMISS}" ]]; then
-      # IMISS columns: INDV N_DATA N_GENOTYPES_FILTERED N_MISS F_MISS
-      # Compute mean and max F_MISS (skip header)
       MEAN_MISS="$(awk 'NR>1{sum+=$5;n+=1} END{if(n>0) printf("%.4f", sum/n); else print "NA"}' "${IMISS}")"
       MAX_MISS="$(awk 'NR>1{if($5>m)m=$5} END{if(NR>1) printf("%.4f", m); else print "NA"}' "${IMISS}")"
-      WORST_SAMPLE="$(awk 'NR>1{if($5>m){m=$5;id=$1}} END{print id}' "${IMISS}")"
+      WORST_SAMPLE="$(awk 'NR>1{if($5>m){m=$5;id=$1;fm=$5}} END{printf("%s (F_MISS=%.4f)", id, fm)}' "${IMISS}")"
       log "Per-sample missingness (F_MISS): mean=${MEAN_MISS}  max=${MAX_MISS} (worst=${WORST_SAMPLE})"
     else
       log "Missingness summary: ${IMISS} not generated"
     fi
+  fi
+
+  # 4) Parental filtering summary
+  log "---- Parental filtering summary ----"
+  if [[ -s "filt.allchr.${PARENT1}.monomorphic_nohets.txt" ]]; then
+    log "Parent1 (${PARENT1}) monomorphic non-het sites: $(wc -l < filt.allchr.${PARENT1}.monomorphic_nohets.txt | tr -d ' ')"
+  else
+    log "Parent1 list not found: filt.allchr.${PARENT1}.monomorphic_nohets.txt"
+  fi
+
+  if [[ -s "filt.allchr.${PARENT2}.monomorphic_nohets.txt" ]]; then
+    log "Parent2 (${PARENT2}) monomorphic non-het sites: $(wc -l < filt.allchr.${PARENT2}.monomorphic_nohets.txt | tr -d ' ')"
+  else
+    log "Parent2 list not found: filt.allchr.${PARENT2}.monomorphic_nohets.txt"
+  fi
+
+  if [[ -s "filt.allchr.parents.monomorphic.txt" ]]; then
+    log "Monomorphic sites between parents (excluded): $(wc -l < filt.allchr.parents.monomorphic.txt | tr -d ' ')"
+  else
+    log "Exclude list not found: filt.allchr.parents.monomorphic.txt"
+  fi
+
+  INFORM_HMP="filt_informsites_${POPULATION}.hmp.txt"
+  if [[ -s "${INFORM_HMP}" ]]; then
+    N_SITES="$(awk 'NR>1{n+=1} END{print n+0}' "${INFORM_HMP}")"
+    N_TAXA="$(awk 'NR==1{print NF-11}' "${INFORM_HMP}")"
+    log "Parent-filtered HapMap: ${INFORM_HMP}"
+    log "Informative sites retained: ${N_SITES}"
+    log "Taxa in parent-filtered HapMap: ${N_TAXA}"
+  else
+    log "Parent-filtered HapMap not found: ${INFORM_HMP}"
   fi
 
   log "Logs folder: ${LOGDIR}"
@@ -109,8 +144,10 @@ log "Starting pipeline for POPULATION=${POPULATION}"
 log "BWA=${BWA}"
 log "VCFTOOLS=${VCFTOOLS_BIN}"
 log "TASSEL5=${GBSPIPELINE}"
+log "TASSEL4=${GBSPIPELINE4}"
 log "REF=${REF}"
 log "MINLOCUSCOV=${MINLOCUSCOV}  MINALLELEFREQ=${MINALLELEFREQ}"
+log "Parents: ${PARENT1} (${PARENTSAMPLE1}), ${PARENT2} (${PARENTSAMPLE2})"
 
 ###############################################################
 # 1) Process FASTQ -> TagDB
@@ -183,4 +220,46 @@ perl "${GBSPIPELINE}" ${JAVA_MEM_20G} \
   -h5 "${POPULATION}.h5" -export "${POPULATION}.hmp.txt" -exportType Hapmap \
   > "${LOGDIR}/10_export_hapmap.out" 2> "${LOGDIR}/10_export_hapmap.err"
 
-log "Pipeline main steps complete (parent filtering steps not included in this excerpt)."
+###############################################################
+# 5) Parental filtering (TASSEL4)
+###############################################################
+log "Step 11: Extract parent hapmaps (TASSEL4)"
+"${GBSPIPELINE4}" ${JAVA_MEM_10G} -fork1 -h "${POPULATION}.hmp.txt" \
+  -fork2 -includeTaxa "${PARENTSAMPLE1}" -input1 -export "filt.allchr.${PARENT1}.hmp.txt" \
+  -runfork1 -runfork2 \
+  > "${LOGDIR}/11_parent1_extract.out" 2> "${LOGDIR}/11_parent1_extract.err"
+
+"${GBSPIPELINE4}" ${JAVA_MEM_10G} -fork1 -h "${POPULATION}.hmp.txt" \
+  -fork2 -includeTaxa "${PARENTSAMPLE2}" -input1 -export "filt.allchr.${PARENT2}.hmp.txt" \
+  -runfork1 -runfork2 \
+  > "${LOGDIR}/12_parent2_extract.out" 2> "${LOGDIR}/12_parent2_extract.err"
+
+"${GBSPIPELINE4}" ${JAVA_MEM_10G} -fork1 -h "${POPULATION}.hmp.txt" \
+  -fork2 -includeTaxa "${PARENTSAMPLE1},${PARENTSAMPLE2}" -input1 -export "filt.allchr.parents_only.hmp.txt" \
+  -runfork1 -runfork2 \
+  > "${LOGDIR}/13_parents_only_extract.out" 2> "${LOGDIR}/13_parents_only_extract.err"
+
+log "Step 12: Build monomorphic site lists (awk)"
+awk 'length($2) == 1 && $2 ~ /[ATGC]/ {print $1}' OFS='\t' \
+  "filt.allchr.${PARENT1}.hmp.txt" > "filt.allchr.${PARENT1}.monomorphic_nohets.txt"
+wc -l "filt.allchr.${PARENT1}.monomorphic_nohets.txt" | tee -a "${LOGDIR}/pipeline.log"
+
+awk 'length($2) == 1 && $2 ~ /[ATGC]/ {print $1}' OFS='\t' \
+  "filt.allchr.${PARENT2}.hmp.txt" > "filt.allchr.${PARENT2}.monomorphic_nohets.txt"
+wc -l "filt.allchr.${PARENT2}.monomorphic_nohets.txt" | tee -a "${LOGDIR}/pipeline.log"
+
+awk 'length($2) == 1 && $2 ~ /[ATGC]/ {print $1}' OFS='\t' \
+  "filt.allchr.parents_only.hmp.txt" > "filt.allchr.parents.monomorphic.txt"
+wc -l "filt.allchr.parents.monomorphic.txt" | tee -a "${LOGDIR}/pipeline.log"
+
+log "Step 13: Apply parent-based filtering (informative sites)"
+"${GBSPIPELINE4}" ${JAVA_MEM_10G} \
+  -fork1 -h "${POPULATION}.hmp.txt" \
+  -fork2 -includeSiteNamesInFile "filt.allchr.${PARENT1}.monomorphic_nohets.txt" -input1 \
+  -fork3 -includeSiteNamesInFile "filt.allchr.${PARENT2}.monomorphic_nohets.txt" -input2 \
+  -fork4 -excludeSiteNamesInFile "filt.allchr.parents.monomorphic.txt" -input3 \
+  -export "filt_informsites_${POPULATION}.hmp.txt" \
+  -runfork1 -runfork2 -runfork3 -runfork4 \
+  > "${LOGDIR}/14_parent_filtering.out" 2> "${LOGDIR}/14_parent_filtering.err"
+
+log "Pipeline complete."
