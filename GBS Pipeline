@@ -1,0 +1,169 @@
+###########################################
+# GBS TASSEL5.0 + VCF Tools Filtering
+# KDoi/VPReyes
+# Modified: March 09, 2026
+###########################################
+
+# Modify this line to line 30 to fit your cases
+# ここから30行めまでを書き換えて
+# define population and keyfile
+export POPULATION="Kasahara1"
+export KEYFILE="Kasahara-1_Keyfile.txt"
+export ENZYME="PstI-MspI"
+
+# define path to tassel5
+export GBSPIPELINE="/linuxhome/reyes/tassel-5-standalone/run_pipeline.pl"
+
+# bwa
+export BWA=$(command -v bwa)
+# add vcftools to path
+export PATH=/usr/local/bin/vcftools:$PATH
+export PERL5LIB=/usr/local/bin
+
+# minimu locus coverage and min allele freqency
+# -mnLCov  locus coverage (0.3-0.9 or 1.0)
+# -mnMAF   minimum allele frequency (set this to the value
+#          so that at least 2 samples are called (eg 0.02))
+#          or 0.1-0.2 is possible for F2 or RILs
+MINLOCUSCOV=0.6
+MINALLELEFREQ=0.02
+
+##### end of specfic parameters to population / environment
+
+###############################################################
+# Process FASTQ to find SNPs and store data into the database #
+###############################################################
+
+# GBSSeqToTagDBPlugin
+perl $GBSPIPELINE  -Xmx20g -fork1 -GBSSeqToTagDBPlugin -db $POPULATION.db -i ./ -k $KEYFILE -kmerLength 64 -e $ENZYME -minKmerL 20 -mnQS 20 -mxKmerNum 100000000 -c 1 -endPlugin -runfork1
+
+# TagExportToFastqPlugin
+perl $GBSPIPELINE -Xmx20g -fork1 -TagExportToFastqPlugin -db $POPULATION.db -o  $POPULATION.db.fa.gz -c 1 -endPlugin -runfork1
+
+# Align with bwa creating index may be needed at first run of bwa
+# bwa index something
+
+$BWA aln -t 4 /local_data/GBS/rice.fa $POPULATION.db.fa.gz  > $POPULATION.sai
+$BWA samse /local_data/GBS/rice.fa $POPULATION.sai $POPULATION.db.fa.gz  > $POPULATION.sam
+
+# SAMToGBSdbPlugin
+perl $GBSPIPELINE -Xmx20g -fork1 -SAMToGBSdbPlugin -i $POPULATION.sam  -db $POPULATION.db  -aProp 0.0 -aLen 0 -endPlugin -runfork1
+
+# DiscoverySNPCallerPluginV2
+
+perl $GBSPIPELINE -Xmx20g -fork1 -DiscoverySNPCallerPluginV2 -db $POPULATION.db -mnLCov $MINLOCUSCOV -mnMAF $MINALLELEFREQ -endPlugin -runfork1
+
+#################################################
+# SNP calling using data stored in the database #
+#################################################
+
+# ProductionSNPCallerPluginV2 - vcf & hapmap format
+perl $GBSPIPELINE -Xmx20g -fork1 -ProductionSNPCallerPluginV2 -db $POPULATION.db -e $ENZYME -i ./ -k $KEYFILE -kmerLength 64 -mnQS 20 -o $POPULATION.vcf -endPlugin -runfork1
+perl $GBSPIPELINE -Xmx20g -fork1 -ProductionSNPCallerPluginV2 -db $POPULATION.db -e $ENZYME -i ./ -k $KEYFILE -kmerLength 64 -mnQS 20 -o $POPULATION.h5 -endPlugin -runfork1
+
+# export Hapmap file
+perl $GBSPIPELINE -Xmx20G -h5 $POPULATION.h5 -export $POPULATION.hmp.txt -exportType Hapmap
+
+
+#################################################
+#	primary filtering done		     #
+#	now filter based on parental alleles   #
+#	and on read depth		　　　#
+#################################################
+
+# set population specific parameters
+POPULATION="Kasahara1"
+PARENT1="T65"
+PARENT2="DV85"
+PARENTSAMPLE1="T65"
+PARENTSAMPLE2="DV85"
+
+# path to tassel4
+GBSPIPELINE=/home/reyes/tassel4-standalone/run_pipeline.pl
+# add vcftools to path
+export PATH=/usr/bin/vcftools:$PATH
+export PERL5LIB=/usr/bin
+
+### end of population specific patameters
+### critera for vcftools are found in late part
+
+# pick up parents
+
+# generate PARENTS1's hapmap
+$GBSPIPELINE -Xmx10g -fork1 -h $POPULATION.hmp.txt -fork2 -includeTaxa ${PARENTSAMPLE1} -input1 -export filt.allchr.${PARENT1}.hmp.txt -runfork1 -runfork2
+
+# same for PARENT2
+$GBSPIPELINE -Xmx10g -fork1 -h $POPULATION.hmp.txt -fork2 -includeTaxa ${PARENTSAMPLE2} -input1 -export filt.allchr.${PARENT2}.hmp.txt -runfork1 -runfork2
+
+#select all parental samples from a hapmap file
+$GBSPIPELINE -Xmx10g -fork1 -h $POPULATION.hmp.txt -fork2 -includeTaxa ${PARENTSAMPLE1},${PARENTSAMPLE2} -input1 -export filt.allchr.parents_only.hmp.txt -runfork1 -runfork2
+
+#find monomorphic non-heterozygous SNPs between parental samples and generate a file listing those sites. Those sites will be INcluded.
+# check column 2 of hmp files for poly/monomorphic
+awk 'length($2) == 1 && $2 ~ /[ATGC]/ {print $1}' OFS='\t' filt.allchr.${PARENT1}.hmp.txt > filt.allchr.${PARENT1}.monomorphic_nohets.txt
+wc -l filt.allchr.${PARENT1}.monomorphic_nohets.txt
+
+awk 'length($2) == 1 && $2 ~ /[ATGC]/ {print $1}' OFS='\t' filt.allchr.${PARENT2}.hmp.txt > filt.allchr.${PARENT2}.monomorphic_nohets.txt
+wc -l filt.allchr.${PARENT2}.monomorphic_nohets.txt
+
+# find monomorphic SNPs between two parents (all 6 parental samples) 
+# and generate a file listing those sites.
+# Those sites will be EXcluded.
+awk 'length($2) == 1 && $2 ~ /[ATGC]/ {print $1}' OFS='\t' filt.allchr.parents_only.hmp.txt > filt.allchr.parents.monomorphic.txt
+wc -l filt.allchr.parents.monomorphic.txt
+
+##### OPTION1 simple parent-filtering 親フィルターのみ
+
+# Integrate files to get parent-filtered genotypes
+
+$GBSPIPELINE -Xmx10g \-fork1 -h $POPULATION.hmp.txt \-fork2 -includeSiteNamesInFile filt.allchr.${PARENT1}.monomorphic_nohets.txt -input1 \-fork3 -includeSiteNamesInfile filt.allchr.${PARENT2}.monomorphic_nohets.txt -input2 \-fork4 -excludeSiteNamesInfile filt.allchr.parents.monomorphic.txt -input3 \-export filt_informsites_$POPULATION.hmp.txt \-runfork1 -runfork2 -runfork3 -runfork4
+
+##### OPTION2 filtering +maf+max-missing+thin64 親フィルター+MAF+missing+thin64
+# vcftools for MAF filtering
+# vcftools for max-missing filtering
+# vcftools for removing site within 64 bases
+
+vcftools --vcf $POPULATION.vcf \--maf 0.05 \--max-missing 0.3 \--thin 64 \--recode \--recode-INFO-all \--out filt.allchr.maf_maxmiss_thin64
+
+# make a list of included markers
+
+tail -n +12 filt.allchr.maf_maxmiss_thin64.recode.vcf | cut -f 3 > \filt.allchr.maf_maxmiss_thin64.txt
+
+# export result of MAF_max-missing_thinned
+$GBSPIPELINE  -Xmx10g \
+    -fork1 -h filt_informsites_$POPULATION.hmp.txt \
+    -fork2 -includeSiteNamesInFile filt.allchr.${PARENT1}.monomorphic_nohets.txt -input1 \
+    -fork3 -includeSiteNamesInfile filt.allchr.${PARENT2}.monomorphic_nohets.txt -input2 \
+    -fork4 -includeSiteNamesInFile filt.allchr.maf_maxmiss_thin64.txt -input3 \
+    -fork5 -excludeSiteNamesInfile filt.allchr.parents.monomorphic.txt -input4 \
+    -export filt_informsites_maf_maxmiss_thin64_${POPULATION}.hmp.txt \
+    -runfork1 -runfork2 -runfork3 -runfork4 -runfork5
+
+##### OPTION3 filtering +maf+max-missing+thin64+depth (option2+Depth)
+#vcftools for depth filtering
+# Apply filtering to vcf file by VCFtools instead of TASSEL
+# Apply maf, SCov and thin filtering to vcf file.
+vcftools --vcf $POPULATION.vcf \
+    --maf 0.05 \
+    --max-missing 0.3 \
+    --thin 64 \
+    --minDP 5 \
+    --recode \
+    --recode-INFO-all \
+    --out filt.allchr.maf_maxmiss_thin64_depth
+# Extract site names, use this to filter_inform
+# This list is for depth filtering
+tail -n +12 filt.allchr.maf_maxmiss_thin64_depth.recode.vcf | cut -f 3 > \
+    filt.allchr.maf_maxmiss_thin64_depth.txt
+wc -1 filt.allchr.maf_maxmiss_thin64_depth.txt
+
+$GBSPIPELINE  -Xmx10g \
+    -fork1 -h $POPULATION.hmp.txt \
+    -fork2 -includeSiteNamesInFile filt.allchr.${PARENT1}.monomorphic_nohets.txt -input1 \
+    -fork3 -includeSiteNamesInfile filt.allchr.${PARENT2}.monomorphic_nohets.txt -input2 \
+    -fork4 -includeSiteNamesInFile filt.allchr.maf_maxmiss_thin64_depth.txt -input3 \
+    -fork5 -excludeSiteNamesInfile filt.allchr.parents.monomorphic.txt -input4 \
+    -export filt_informsites_maf_maxmiss_thin64_depth_${POPULATION}.hmp.txt \
+    -runfork1 -runfork2 -runfork3 -runfork4 -runfork5
+wc -l filt_informsites_maf_maxmiss_thin64_depth_${POPULATION}.hmp.txt
+
